@@ -4,7 +4,7 @@ version: 0.1.0
 author: Manuel "Overlord" Michalski <www.47k.de>
 description: Monitor Hetzner Cloud Load Balancers, targets, health, and metrics via the official Cloud API.
 license: Apache-2.0
-min_version: 2.5.0
+min_version: 2.4.0
 edition:
   - cre
   - cee
