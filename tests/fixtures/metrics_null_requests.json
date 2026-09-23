@@ -1,0 +1,14 @@
+{
+  "metrics": {
+    "start": "2026-09-21T18:39:00+00:00",
+    "end": "2026-09-21T18:44:00+00:00",
+    "step": 60,
+    "time_series": {
+      "open_connections": {"values": [[1790016180, "2.0"], [1790016240, "3.0"]]},
+      "connections_per_second": {"values": [[1790016240, "0.333333"]]},
+      "requests_per_second": null,
+      "bandwidth.in": {"values": [[1790016240, "190.666667"]]},
+      "bandwidth.out": {"values": [[1790016240, "2549.666667"]]}
+    }
+  }
+}

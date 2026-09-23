@@ -1,0 +1,41 @@
+{
+  "load_balancers": [
+    {
+      "id": 101001,
+      "name": "smtp-lb-test",
+      "status": "running",
+      "load_balancer_type": {"id": 1, "name": "lb11"},
+      "location": {"id": 1, "name": "fsn-test"},
+      "algorithm": {"type": "least_connections"},
+      "public_net": {
+        "enabled": true,
+        "ipv4": {"ip": "192.0.2.100"},
+        "ipv6": {"ip": "2001:db8::100"}
+      },
+      "services": [
+        {
+          "protocol": "tcp",
+          "listen_port": 25,
+          "destination_port": 26,
+          "proxyprotocol": true,
+          "health_check": {"protocol": "tcp", "port": 26, "interval": 15, "timeout": 10, "retries": 3}
+        }
+      ],
+      "targets": [
+        {
+          "type": "server",
+          "server": {"id": 201001, "ip": "192.0.2.10"},
+          "use_private_ip": false,
+          "health_status": [{"listen_port": 25, "status": "healthy"}]
+        },
+        {
+          "type": "server",
+          "server": {"id": 201002, "ip": "192.0.2.11"},
+          "use_private_ip": false,
+          "health_status": [{"listen_port": 25, "status": "unhealthy"}]
+        }
+      ]
+    }
+  ],
+  "meta": {"pagination": {"page": 1, "last_page": 1, "next_page": null}}
+}

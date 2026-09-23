@@ -1,0 +1,32 @@
+{
+  "load_balancers": [
+    {
+      "id": 101001,
+      "name": "mail-test",
+      "load_balancer_type": {"name": "lb11"},
+      "location": {"name": "fsn-test"},
+      "algorithm": {"type": "least_connections"},
+      "services": [
+        {"protocol": "tcp", "listen_port": 25, "destination_port": 26, "health_check": {"protocol": "tcp", "port": 26}},
+        {"protocol": "tcp", "listen_port": 465, "destination_port": 465, "health_check": {"protocol": "tcp", "port": 465}}
+      ],
+      "targets": [
+        {"type": "server", "server": {"id": 201001}, "health_status": [{"listen_port": 25, "status": "healthy"}, {"listen_port": 465, "status": "healthy"}]},
+        {"type": "server", "server": {"id": 201002}, "health_status": [{"listen_port": 25, "status": "unhealthy"}, {"listen_port": 465, "status": "healthy"}]}
+      ]
+    },
+    {
+      "id": 101002,
+      "name": "web-test",
+      "load_balancer_type": {"name": "lb21"},
+      "location": {"name": "hel-test"},
+      "algorithm": {"type": "round_robin"},
+      "services": [
+        {"protocol": "https", "listen_port": 443, "destination_port": 8443, "health_check": {"protocol": "https", "port": 8443, "http": {"path": "/health", "status_codes": [200]}}}
+      ],
+      "targets": [
+        {"type": "label_selector", "label_selector": {"selector": "role=test-web"}, "health_status": [{"listen_port": 443, "status": "healthy"}]}
+      ]
+    }
+  ]
+}

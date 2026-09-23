@@ -1,0 +1,17 @@
+name: hetzner_loadbalancer
+title: Hetzner Cloud Load Balancer Monitoring
+version: 0.1.0
+author: Manuel "Overlord" Michalski <www.47k.de>
+description: Monitor Hetzner Cloud Load Balancers, targets, health, and metrics via the official Cloud API.
+license: Apache-2.0
+min_version: 2.5.0
+edition:
+  - cre
+  - cee
+download_url: https://github.com/47k/checkmk-hetzner-loadbalancer
+files:
+  - cmk_addons/plugins/hetzner_loadbalancer/agent_based/hetzner_loadbalancer.py
+  - cmk_addons/plugins/hetzner_loadbalancer/graphing/hetzner_loadbalancer.py
+  - cmk_addons/plugins/hetzner_loadbalancer/libexec/agent_hetzner_loadbalancer
+  - cmk_addons/plugins/hetzner_loadbalancer/rulesets/hetzner_loadbalancer.py
+  - cmk_addons/plugins/hetzner_loadbalancer/server_side_calls/hetzner_loadbalancer.py

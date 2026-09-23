@@ -1,0 +1,923 @@
+#!/usr/bin/env python3
+"""Checkmk special agent for Hetzner Cloud Load Balancers."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import math
+import os
+import socket
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+DEFAULT_API_URL = "https://api.hetzner.cloud/v1"
+SECTION_NAME = "hetzner_loadbalancer"
+USER_AGENT = "checkmk-hetzner-loadbalancer/0.1.0"
+METRIC_TYPES = "open_connections,connections_per_second,requests_per_second,bandwidth"
+METRIC_WINDOW = timedelta(minutes=5)
+METRIC_STEP_SECONDS = 60
+MAX_METRIC_AGE_SECONDS = 120
+MAX_PAGES = 1000
+DEFAULT_CACHE_TTL_SECONDS = 60
+DEFAULT_CACHE_MAX_STALE_AGE_SECONDS = 900
+DEFAULT_CACHE_LOCK_TIMEOUT = 1.0
+CACHE_SCHEMA_VERSION = 1
+CACHE_CLEANUP_RETENTION_SECONDS = 30 * 24 * 60 * 60
+CACHE_CLEANUP_SUFFIXES = {".json", ".lock"}
+
+
+class AgentError(Exception):
+    """An error safe to report in the agent section."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def as_dict(self) -> dict[str, str]:
+        return {"code": self.code, "message": self.message}
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--api-token", required=True, help="Hetzner Cloud API token")
+    parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Hetzner Cloud API base URL")
+    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds")
+    parser.add_argument(
+        "--fetch-metrics",
+        dest="fetch_metrics",
+        action="store_true",
+        default=True,
+        help="Fetch Load Balancer performance metrics",
+    )
+    parser.add_argument(
+        "--no-fetch-metrics",
+        dest="fetch_metrics",
+        action="store_false",
+        help="Do not fetch performance metrics",
+    )
+    parser.add_argument(
+        "--cache-enabled",
+        dest="cache_enabled",
+        action="store_true",
+        default=True,
+        help="Enable the site-local result cache",
+    )
+    parser.add_argument(
+        "--no-cache-enabled",
+        dest="cache_enabled",
+        action="store_false",
+        help="Disable the site-local result cache",
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=DEFAULT_CACHE_TTL_SECONDS,
+        help=f"Result cache time-to-live in seconds, default {DEFAULT_CACHE_TTL_SECONDS}",
+    )
+    parser.add_argument(
+        "--cache-max-stale-age",
+        type=int,
+        default=DEFAULT_CACHE_MAX_STALE_AGE_SECONDS,
+        help=(
+            "Maximum age in seconds for stale fallback, default "
+            f"{DEFAULT_CACHE_MAX_STALE_AGE_SECONDS}"
+        ),
+    )
+    parser.add_argument(
+        "--cache-stale-on-error",
+        dest="cache_stale_on_error",
+        action="store_true",
+        default=True,
+        help="Use an expired cached result when fresh collection fails",
+    )
+    parser.add_argument(
+        "--no-cache-stale-on-error",
+        dest="cache_stale_on_error",
+        action="store_false",
+        help="Do not use expired cache entries after collection failures",
+    )
+    parser.add_argument("--cache-dir", default=None, help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
+
+
+def resolve_api_token(raw_token: str) -> str:
+    """Resolve a Checkmk password-store reference, while allowing direct CLI use."""
+
+    if ":" not in raw_token:
+        return raw_token
+
+    password_id, password_file = raw_token.split(":", 1)
+    if not password_id or not password_file.startswith("/"):
+        return raw_token
+
+    try:
+        from cmk.utils.password_store import lookup
+
+        return lookup(Path(password_file), password_id)
+    except Exception as exc:
+        raise AgentError("secret_error", "Unable to resolve API token from the Checkmk password store") from exc
+
+
+def sanitize_message(message: str, api_token: str) -> str:
+    return message.replace(api_token, "<redacted>") if api_token else message
+
+
+def _api_url(base_url: str, path: str, query: dict[str, str] | None = None) -> str:
+    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+    return f"{url}?{urllib.parse.urlencode(query)}" if query else url
+
+
+def request_json(url: str, api_token: str, timeout: int) -> dict[str, Any] | list[Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_token}",
+            "User-Agent": USER_AGENT,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = _http_error_detail(exc)
+        code = "auth_error" if exc.code in (401, 403) else "http_error"
+        suffix = f": {detail}" if detail else ""
+        raise AgentError(code, f"HTTP {exc.code} while fetching {url}{suffix}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        code = "timeout" if isinstance(reason, (socket.timeout, TimeoutError)) else "network_error"
+        raise AgentError(code, f"Unable to fetch {url}: {reason or exc}") from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise AgentError("timeout", f"Timed out while fetching {url}") from exc
+
+    try:
+        decoded = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AgentError("decode_error", f"API response from {url} is not valid UTF-8") from exc
+    try:
+        parsed: dict[str, Any] | list[Any] = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        raise AgentError("json_error", f"API response from {url} is not valid JSON: {exc}") from exc
+    return parsed
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body[:300]
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])[:300]
+        for key in ("message", "detail"):
+            if payload.get(key):
+                return str(payload[key])[:300]
+    return body[:300]
+
+
+def _load_balancers_from_payload(payload: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
+    entries = payload.get("load_balancers") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        raise AgentError("api_response_error", "API response field 'load_balancers' is not a list")
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise AgentError("api_response_error", "A Load Balancer entry is not an object")
+    return entries
+
+
+def _next_page(payload: dict[str, Any] | list[Any], current_page: int) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("meta")
+    pagination = meta.get("pagination") if isinstance(meta, dict) else payload.get("pagination")
+    if not isinstance(pagination, dict):
+        return None
+    next_page = pagination.get("next_page")
+    if isinstance(next_page, int) and next_page > current_page:
+        return next_page
+    last_page = pagination.get("last_page")
+    if isinstance(last_page, int) and current_page < last_page:
+        return current_page + 1
+    return None
+
+
+def fetch_load_balancers(api_url: str, api_token: str, timeout: int) -> list[dict[str, Any]]:
+    load_balancers: list[dict[str, Any]] = []
+    page = 1
+    for _ in range(MAX_PAGES):
+        url = _api_url(api_url, "load_balancers", {"page": str(page), "per_page": "50"})
+        payload = request_json(url, api_token, timeout)
+        load_balancers.extend(_load_balancers_from_payload(payload))
+        following_page = _next_page(payload, page)
+        if following_page is None:
+            return load_balancers
+        page = following_page
+    raise AgentError("pagination_error", f"Load Balancer pagination exceeded {MAX_PAGES} pages")
+
+
+def _object_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("name", "type", "ip", "id"):
+            if value.get(key) not in (None, ""):
+                return str(value[key])
+    if value not in (None, "") and not isinstance(value, (dict, list)):
+        return str(value)
+    return None
+
+
+def _normalized_health_check(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: value[key]
+        for key in ("protocol", "port", "interval", "timeout", "retries")
+        if value.get(key) is not None
+    }
+    http = value.get("http")
+    if isinstance(http, dict):
+        result["http"] = {
+            key: http[key]
+            for key in ("domain", "path", "response", "status_codes", "tls")
+            if http.get(key) is not None
+        }
+    return result
+
+
+def _normalized_service(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "protocol": str(value.get("protocol") or "unknown").lower(),
+        "listen_port": value.get("listen_port"),
+        "destination_port": value.get("destination_port"),
+        "proxyprotocol": value.get("proxyprotocol"),
+        "health_check": _normalized_health_check(value.get("health_check")),
+    }
+
+
+def _target_identity(target: dict[str, Any]) -> tuple[str, str]:
+    target_type = str(target.get("type") or "unknown").lower()
+    container = target.get(target_type)
+    if not isinstance(container, dict):
+        container = {}
+
+    if target_type == "server":
+        if (server_id := container.get("id")) not in (None, ""):
+            return f"server:{server_id}", f"server {server_id}"
+        if (server_ip := container.get("ip")) not in (None, ""):
+            return f"server:ip:{server_ip}", f"server {server_ip}"
+    elif target_type == "label_selector":
+        if (selector := container.get("selector")) not in (None, ""):
+            return f"label_selector:{selector}", f"label selector {selector}"
+    elif target_type == "ip":
+        address = container.get("ip")
+        if address in (None, "") and isinstance(target.get("ip"), str):
+            address = target["ip"]
+        if address not in (None, ""):
+            return f"ip:{address}", f"IP {address}"
+    else:
+        if (target_id := container.get("id")) not in (None, ""):
+            return f"{target_type}:id:{target_id}", f"{target_type} {target_id}"
+        if (target_ip := container.get("ip")) not in (None, ""):
+            return f"{target_type}:ip:{target_ip}", f"{target_type} {target_ip}"
+
+    stable_source = {key: item for key, item in target.items() if key != "health_status"}
+    digest = hashlib.sha256(
+        json.dumps(stable_source, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{target_type}:unknown:{digest}", f"{target_type} target {digest}"
+
+
+def _normalized_target(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    target_type = str(value.get("type") or "unknown").lower()
+    identity, display = _target_identity(value)
+    container = value.get(target_type)
+    target_data = dict(container) if isinstance(container, dict) else {}
+    health_status: list[dict[str, Any]] = []
+    raw_health = value.get("health_status")
+    if isinstance(raw_health, list):
+        for health in raw_health:
+            if isinstance(health, dict):
+                health_status.append(
+                    {
+                        "listen_port": health.get("listen_port"),
+                        "status": str(health.get("status") or "unknown").lower(),
+                    }
+                )
+    return {
+        "type": target_type,
+        "key": identity,
+        "display": display,
+        "target": target_data,
+        "use_private_ip": value.get("use_private_ip"),
+        "health_status": health_status,
+    }
+
+
+def normalize_load_balancer(value: dict[str, Any]) -> dict[str, Any]:
+    raw_id = value.get("id")
+    warnings: list[str] = []
+    if raw_id in (None, ""):
+        digest = hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()[:12]
+        lb_id = f"unknown-{digest}"
+        warnings.append("Load Balancer ID is missing from the API response")
+    else:
+        lb_id = str(raw_id)
+
+    raw_services = value.get("services") if isinstance(value.get("services"), list) else []
+    raw_targets = value.get("targets") if isinstance(value.get("targets"), list) else []
+    services = [service for raw in raw_services if (service := _normalized_service(raw)) is not None]
+    targets = [target for raw in raw_targets if (target := _normalized_target(raw)) is not None]
+    public_net = value.get("public_net")
+    public_net = public_net if isinstance(public_net, dict) else {}
+
+    normalized = {
+        "id": lb_id,
+        "name": str(value.get("name") or f"Load Balancer {lb_id}"),
+        "type": _object_name(value.get("load_balancer_type")) or "unknown",
+        "location": _object_name(value.get("location")) or "unknown",
+        "algorithm": _object_name(value.get("algorithm")) or "unknown",
+        "public_net": {
+            "enabled": public_net.get("enabled"),
+            "ipv4": _object_name(public_net.get("ipv4")),
+            "ipv6": _object_name(public_net.get("ipv6")),
+        },
+        "services": services,
+        "targets": targets,
+        "warnings": warnings,
+    }
+    if value.get("status") not in (None, ""):
+        normalized["status"] = str(value["status"])
+    return normalized
+
+
+def _number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _metrics_query_end_timestamp(metrics: dict[str, Any]) -> float:
+    raw_end = metrics.get("end")
+    if not isinstance(raw_end, str):
+        raise AgentError("api_response_error", "Metrics API response field 'metrics.end' is missing or invalid")
+    try:
+        parsed = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AgentError("api_response_error", "Metrics API response field 'metrics.end' is not ISO-8601") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def select_metric_values(
+    payload: dict[str, Any] | list[Any],
+    query_end_timestamp: float | None = None,
+) -> tuple[dict[str, dict[str, float]], dict[str, str]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("metrics"), dict):
+        raise AgentError("api_response_error", "Metrics API response field 'metrics' is missing or invalid")
+    metrics_payload = payload["metrics"]
+    time_series = metrics_payload.get("time_series")
+    if not isinstance(time_series, dict):
+        raise AgentError("api_response_error", "Metrics API response field 'metrics.time_series' is invalid")
+    reference_timestamp = (
+        query_end_timestamp
+        if query_end_timestamp is not None
+        else _metrics_query_end_timestamp(metrics_payload)
+    )
+
+    latest: dict[str, dict[str, float]] = {}
+    unavailable: dict[str, str] = {}
+    for metric_name in (
+        "open_connections",
+        "connections_per_second",
+        "requests_per_second",
+        "bandwidth.in",
+        "bandwidth.out",
+    ):
+        series = time_series.get(metric_name)
+        values = series.get("values") if isinstance(series, dict) else None
+        if not isinstance(values, list):
+            unavailable[metric_name] = "unavailable (no samples returned)"
+            continue
+        candidates: list[tuple[float, float]] = []
+        for sample in values:
+            if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+                continue
+            timestamp = _number(sample[0])
+            metric_value = _number(sample[1])
+            if timestamp is not None and metric_value is not None:
+                candidates.append((timestamp, metric_value))
+        if candidates:
+            timestamp, metric_value = max(candidates, key=lambda sample: sample[0])
+            age_seconds = reference_timestamp - timestamp
+            if age_seconds > MAX_METRIC_AGE_SECONDS:
+                unavailable[metric_name] = (
+                    f"stale (newest valid sample is {age_seconds:.0f}s old; "
+                    f"maximum {MAX_METRIC_AGE_SECONDS}s)"
+                )
+                continue
+            latest[metric_name] = {"timestamp": timestamp, "value": metric_value}
+        else:
+            unavailable[metric_name] = "unavailable (no valid non-null samples)"
+    return latest, unavailable
+
+
+def latest_metric_values(payload: dict[str, Any] | list[Any]) -> dict[str, dict[str, float]]:
+    latest, _unavailable = select_metric_values(payload)
+    return latest
+
+
+def fetch_metrics(
+    api_url: str,
+    api_token: str,
+    timeout: int,
+    lb_id: str,
+    now: datetime | None = None,
+) -> tuple[dict[str, dict[str, float]], dict[str, str]]:
+    end = now or datetime.now(timezone.utc)
+    start = end - METRIC_WINDOW
+    query = {
+        "type": METRIC_TYPES,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "step": str(METRIC_STEP_SECONDS),
+    }
+    payload = request_json(_api_url(api_url, f"load_balancers/{lb_id}/metrics", query), api_token, timeout)
+    return select_metric_values(payload, end.timestamp())
+
+
+def collect(args: argparse.Namespace, api_token: str) -> dict[str, Any]:
+    raw_load_balancers = fetch_load_balancers(args.api_url, api_token, args.timeout)
+    load_balancers = [normalize_load_balancer(value) for value in raw_load_balancers]
+
+    if args.fetch_metrics:
+        for load_balancer in load_balancers:
+            lb_id = load_balancer["id"]
+            if lb_id.startswith("unknown-"):
+                load_balancer["metrics"] = {}
+                load_balancer["metrics_error"] = {
+                    "code": "missing_id",
+                    "message": "Metrics cannot be requested because the Load Balancer ID is missing",
+                }
+                continue
+            try:
+                metrics, unavailable = fetch_metrics(args.api_url, api_token, args.timeout, lb_id)
+                load_balancer["metrics"] = metrics
+                load_balancer["metrics_unavailable"] = unavailable
+            except AgentError as exc:
+                load_balancer["metrics"] = {}
+                load_balancer["metrics_error"] = {
+                    "code": exc.code,
+                    "message": sanitize_message(exc.message, api_token),
+                }
+            except Exception as exc:
+                load_balancer["metrics"] = {}
+                load_balancer["metrics_error"] = {
+                    "code": "unexpected_error",
+                    "message": sanitize_message(f"Unexpected metrics collection error: {exc}", api_token),
+                }
+
+    return {
+        "load_balancers": load_balancers,
+        "errors": [],
+        "metrics_enabled": bool(args.fetch_metrics),
+        "metric_collection": {
+            "window_seconds": int(METRIC_WINDOW.total_seconds()),
+            "step_seconds": METRIC_STEP_SECONDS,
+            "max_sample_age_seconds": MAX_METRIC_AGE_SECONDS,
+            "selection": "latest_non_null_sample",
+        },
+    }
+
+
+def default_cache_directory() -> Path:
+    omd_root = os.environ.get("OMD_ROOT")
+    if omd_root:
+        return Path(omd_root) / "var/check_mk/cache/hetzner_loadbalancer"
+    return Path("~/var/check_mk/cache/hetzner_loadbalancer").expanduser()
+
+
+def cache_paths(args: argparse.Namespace, api_token: str) -> tuple[Path, Path, Path, dict[str, Any], str]:
+    directory = Path(args.cache_dir).expanduser() if args.cache_dir else default_cache_directory()
+    cache_key = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "api_url": str(args.api_url).rstrip("/"),
+        "api_token_hash": hashlib.sha256(api_token.encode("utf-8")).hexdigest(),
+        "timeout": int(args.timeout),
+        "fetch_metrics": bool(args.fetch_metrics),
+    }
+    serialized_key = json.dumps(cache_key, sort_keys=True, separators=(",", ":"))
+    cache_hash = hashlib.sha256(serialized_key.encode("utf-8")).hexdigest()
+    return (
+        directory,
+        directory / f"loadbalancer_{cache_hash}.json",
+        directory / f"loadbalancer_{cache_hash}.lock",
+        cache_key,
+        cache_hash,
+    )
+
+
+def collect_with_cache(
+    args: argparse.Namespace,
+    api_token: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    ttl = int(args.cache_ttl)
+    max_stale_age = int(args.cache_max_stale_age)
+    if ttl < 1:
+        raise AgentError("configuration_error", "Result cache TTL must be at least one second")
+    if max_stale_age < 1:
+        raise AgentError("configuration_error", "Maximum stale age must be at least one second")
+    if args.cache_stale_on_error and max_stale_age < ttl:
+        raise AgentError(
+            "configuration_error",
+            "Maximum stale age must be at least as large as the result cache TTL",
+        )
+    directory, cache_file, lock_file, cache_key, cache_hash = cache_paths(args, api_token)
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return collect(args, api_token), cache_info_for_collection(ttl, max_stale_age, "unavailable")
+
+    cleanup_cache_directory(directory, ttl, protected_paths=(cache_file, lock_file))
+
+    cached = read_cache_entry(cache_file, cache_hash)
+    if cached is not None and cache_entry_is_fresh(cached, ttl, time.time()):
+        return payload_from_cache_entry(cached), cache_info_from_entry(
+            "hit", cached, ttl, max_stale_age
+        )
+
+    lock_handle = acquire_cache_lock(lock_file)
+    if lock_handle is None:
+        cached_after_wait = read_cache_entry(cache_file, cache_hash)
+        if cached_after_wait is not None:
+            now = time.time()
+            if cache_entry_is_fresh(cached_after_wait, ttl, now):
+                return payload_from_cache_entry(cached_after_wait), cache_info_from_entry(
+                    "hit", cached_after_wait, ttl, max_stale_age
+                )
+            if args.cache_stale_on_error and cache_entry_within_stale_limit(
+                cached_after_wait, max_stale_age, now
+            ):
+                return payload_from_cache_entry(cached_after_wait), cache_info_from_entry(
+                    "stale_lock", cached_after_wait, ttl, max_stale_age
+                )
+        return collect(args, api_token), cache_info_for_collection(
+            ttl, max_stale_age, "lock_unavailable"
+        )
+
+    try:
+        cached_after_lock = read_cache_entry(cache_file, cache_hash)
+        if cached_after_lock is not None and cache_entry_is_fresh(cached_after_lock, ttl, time.time()):
+            return payload_from_cache_entry(cached_after_lock), cache_info_from_entry(
+                "hit", cached_after_lock, ttl, max_stale_age
+            )
+
+        stale_candidate = cached_after_lock or cached
+        try:
+            payload = collect(args, api_token)
+        except Exception as exc:
+            if (
+                args.cache_stale_on_error
+                and stale_candidate is not None
+                and cache_entry_within_stale_limit(stale_candidate, max_stale_age, time.time())
+            ):
+                return (
+                    payload_from_cache_entry(stale_candidate),
+                    cache_info_from_entry(
+                        "stale_on_error",
+                        stale_candidate,
+                        ttl,
+                        max_stale_age,
+                        error=exception_message(exc, api_token),
+                    ),
+                )
+            raise
+
+        collected_at = time.time()
+        write_cache_entry(cache_file, cache_key, cache_hash, payload, collected_at)
+        return payload, cache_info_for_collection(
+            ttl, max_stale_age, "refresh", collected_at=collected_at
+        )
+    finally:
+        release_cache_lock(lock_handle)
+
+
+def payload_from_cache_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return {
+            "load_balancers": [],
+            "errors": [{"code": "cache_error", "message": "Cached payload is invalid"}],
+            "metrics_enabled": False,
+        }
+    return dict(payload)
+
+
+def exception_message(exc: Exception, api_token: str) -> str:
+    if isinstance(exc, AgentError):
+        return sanitize_message(exc.message, api_token)
+    return sanitize_message(str(exc) or "Unexpected collection error", api_token)
+
+
+def read_cache_entry(cache_file: Path, expected_hash: str) -> dict[str, Any] | None:
+    try:
+        with cache_file.open("r", encoding="utf-8") as handle:
+            entry = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("schema_version") != CACHE_SCHEMA_VERSION or entry.get("cache_hash") != expected_hash:
+        return None
+    if not isinstance(entry.get("collected_at"), (int, float)):
+        return None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(payload.get("load_balancers"), list) or not isinstance(payload.get("errors", []), list):
+        return None
+    return entry
+
+
+def cache_entry_is_fresh(entry: dict[str, Any], ttl: int, now: float) -> bool:
+    if ttl <= 0:
+        return False
+    collected_at = entry.get("collected_at")
+    if not isinstance(collected_at, (int, float)):
+        return False
+    return now - float(collected_at) <= ttl
+
+
+def cache_entry_within_stale_limit(entry: dict[str, Any], max_stale_age: int, now: float) -> bool:
+    if max_stale_age < 1:
+        return False
+    collected_at = entry.get("collected_at")
+    if not isinstance(collected_at, (int, float)):
+        return False
+    return now - float(collected_at) <= max_stale_age
+
+
+def cache_file_is_valid_for_ttl(cache_file: Path, ttl: int, now: float) -> bool:
+    if ttl <= 0:
+        return False
+    try:
+        with cache_file.open("r", encoding="utf-8") as handle:
+            entry = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return False
+    if not isinstance(entry, dict) or entry.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return False
+    collected_at = entry.get("collected_at")
+    return isinstance(collected_at, (int, float)) and now - float(collected_at) <= ttl
+
+
+def cleanup_cache_directory(
+    directory: Path,
+    ttl: int,
+    *,
+    protected_paths: Iterable[Path] = (),
+) -> None:
+    now = time.time()
+    cutoff = now - CACHE_CLEANUP_RETENTION_SECONDS
+    protected = set(protected_paths)
+    try:
+        candidates = list(directory.iterdir())
+    except OSError:
+        return
+
+    for candidate in candidates:
+        try:
+            if candidate in protected or candidate.suffix not in CACHE_CLEANUP_SUFFIXES:
+                continue
+            if not candidate.is_file() or candidate.stat().st_mtime >= cutoff:
+                continue
+            if candidate.suffix == ".json" and cache_file_is_valid_for_ttl(candidate, ttl, now):
+                continue
+            candidate.unlink()
+        except OSError:
+            continue
+
+
+def write_cache_entry(
+    cache_file: Path,
+    cache_key: dict[str, Any],
+    cache_hash: str,
+    payload: dict[str, Any],
+    collected_at: float,
+) -> None:
+    entry = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "created_at": collected_at,
+        "collected_at": collected_at,
+        "cache_key": cache_key,
+        "cache_hash": cache_hash,
+        "payload": payload,
+    }
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(cache_file.parent),
+            prefix=f".{cache_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            json.dump(entry, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, cache_file)
+    except OSError:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def acquire_cache_lock(lock_file: Path, timeout: float = DEFAULT_CACHE_LOCK_TIMEOUT) -> Any | None:
+    try:
+        handle = lock_file.open("a", encoding="utf-8")
+    except OSError:
+        return None
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"pid={os.getpid()} acquired_at={time.time():.3f}\n")
+            handle.flush()
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                return None
+            time.sleep(0.05)
+        except OSError:
+            handle.close()
+            return None
+
+
+def release_cache_lock(handle: Any | None) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+def cache_info_from_entry(
+    status: str,
+    entry: dict[str, Any],
+    ttl: int,
+    max_stale_age: int,
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    collected_at = float(entry["collected_at"])
+    age = max(0.0, time.time() - collected_at)
+    stale = status in {"stale_on_error", "stale_lock"} or not cache_entry_is_fresh(
+        entry, ttl, time.time()
+    )
+    messages = {
+        "hit": "fresh result cache hit",
+        "stale_on_error": "stale result cache used after refresh failure",
+        "stale_lock": "stale result cache used while refresh is already running",
+    }
+    info: dict[str, Any] = {
+        "enabled": True,
+        "status": status,
+        "stale": stale,
+        "age_seconds": round(age, 3),
+        "ttl_seconds": ttl,
+        "max_stale_age_seconds": max_stale_age,
+        "collected_at": collected_at,
+        "message": f"{messages.get(status, 'result cache used')} (age {int(age)}s, ttl {ttl}s)",
+    }
+    if error:
+        info["error"] = error
+    return info
+
+
+def cache_info_for_collection(
+    ttl: int,
+    max_stale_age: int,
+    status: str,
+    *,
+    collected_at: float | None = None,
+) -> dict[str, Any]:
+    collected_at = time.time() if collected_at is None else collected_at
+    labels = {
+        "refresh": "fresh collection stored in result cache",
+        "lock_unavailable": "fresh collection completed without updating result cache",
+        "unavailable": "result cache unavailable, using fresh collection",
+    }
+    return {
+        "enabled": True,
+        "status": status,
+        "stale": False,
+        "age_seconds": 0,
+        "ttl_seconds": ttl,
+        "max_stale_age_seconds": max_stale_age,
+        "collected_at": collected_at,
+        "message": f"{labels.get(status, 'fresh collection')} (age 0s, ttl {ttl}s)",
+    }
+
+
+def disabled_cache_info() -> dict[str, Any]:
+    return {"enabled": False, "status": "disabled", "stale": False}
+
+
+def emit_section(payload: dict[str, Any]) -> None:
+    print(f"<<<{SECTION_NAME}:sep(0)>>>")
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_arguments(argv)
+    api_token = ""
+    try:
+        if args.timeout < 1:
+            raise AgentError("configuration_error", "Timeout must be at least one second")
+        if args.cache_enabled and args.cache_ttl < 1:
+            raise AgentError("configuration_error", "Result cache TTL must be at least one second")
+        if args.cache_enabled and args.cache_max_stale_age < 1:
+            raise AgentError("configuration_error", "Maximum stale age must be at least one second")
+        if (
+            args.cache_enabled
+            and args.cache_stale_on_error
+            and args.cache_max_stale_age < args.cache_ttl
+        ):
+            raise AgentError(
+                "configuration_error",
+                "Maximum stale age must be at least as large as the result cache TTL",
+            )
+        api_token = resolve_api_token(args.api_token)
+        if args.cache_enabled:
+            payload, cache_info = collect_with_cache(args, api_token)
+        else:
+            payload = collect(args, api_token)
+            cache_info = disabled_cache_info()
+        payload["cache"] = cache_info
+    except AgentError as exc:
+        payload = {
+            "load_balancers": [],
+            "errors": [{"code": exc.code, "message": sanitize_message(exc.message, api_token)}],
+            "metrics_enabled": bool(args.fetch_metrics),
+        }
+    except Exception as exc:
+        payload = {
+            "load_balancers": [],
+            "errors": [
+                {
+                    "code": "unexpected_error",
+                    "message": sanitize_message(f"Unexpected collection error: {exc}", api_token),
+                }
+            ],
+            "metrics_enabled": bool(args.fetch_metrics),
+        }
+    emit_section(payload)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
